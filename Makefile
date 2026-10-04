@@ -14,3 +14,14 @@ determinism:
 	@echo "  ./run stories15M.bin -s 42 -n 50"
 	@echo "  ./run stories15M.bin -s 42 -n 50"
 	@echo "  ./run stories15M.bin -s 43 -n 50"
+
+.PHONY: day2 test serve
+
+day2:
+	@echo "Day 2: snapshot save/load implementation added under worker/"
+
+test:
+	python3 -m unittest discover -v
+
+serve:
+	python3 -m worker.server 8000
