@@ -94,17 +94,11 @@ This repo is intentionally small and opinionated. It is designed to answer a sys
 
 The answer here is not a production-grade serving platform. It is a focused study in deterministic replay, durable session state, and failover design decisions.
 
-## Why this is a good engineering project
+## Why this project matters
 
-From a senior-engineering and hiring-manager perspective, this project demonstrates several strengths:
+This repo is aimed at a very specific systems question: when a generation worker fails mid-stream, how do you preserve correctness and resume without duplicating or losing output?
 
-- strong systems thinking around failure modes and correctness
-- practical understanding of state management in distributed computation
-- experience working across C++ and Python components
-- explicit attention to determinism, recovery, and reproducibility
-- a clear project narrative with a defined milestone structure and remaining work
-
-This is the kind of repo that reads like an engineering artifact rather than a loose collection of experiments: there is a concrete problem, a clear architecture, a bounded MVP, and a visible roadmap for what remains.
+The value here is in framing the problem cleanly and making the tradeoffs explicit: deterministic replay, durable state, and recovery strategy are all part of the design rather than afterthoughts.
 
 ## Credits
 
