@@ -3,3 +3,6 @@ Fault Tolerant Inference Design Doc.md
 docs/DESIGN.md
 worker/snapshots/
 __pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
