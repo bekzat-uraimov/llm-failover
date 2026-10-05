@@ -25,3 +25,6 @@ test:
 
 serve:
 	python3 -m worker.server 8000
+
+serve-router:
+	python3 -m router.server 8002
