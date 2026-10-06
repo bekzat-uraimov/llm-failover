@@ -2,108 +2,64 @@
 
 Kill the worker mid-sentence. Another one finishes it, byte for byte.
 
-This project explores a concrete systems problem in LLM serving: how do you continue a generation when a worker dies in the middle of a token stream without losing correctness or duplicating output? The goal is not to build a production inference stack; it is to study the design tradeoffs behind fault-tolerant, stateful inference using a tiny model as the workload.
+When an LLM worker dies halfway through a generation, its KV cache dies with it. This project takes the position that the KV cache doesn't need to survive. Given the model weights, the token history, the sampler's RNG state and the current position, the next token is fully determined. So a replacement worker can replay the tokens, rebuild the cache and continue the exact same output. This repo builds that recovery path one piece at a time, using Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) `stories15M` model as the workload.
 
-## What this project is
+## Status
 
-At a high level, this repo models a minimal distributed setup with:
+Done:
 
-- a C++ inference engine adapted from llama2.c
-- worker processes that generate text and hold ephemeral runtime state
-- a Python router that manages sessions, determines when a worker has failed, and coordinates recovery
-- a durable session log that stores enough information to rebuild generation on another worker
+- **Determinism check.** Ran llama2.c twice with `-s 42` and got identical output; `-s 43` diverged. This was a manual check, written up in [notes/day1.md](notes/day1.md).
+- **Snapshots.** [worker/snapshot.py](worker/snapshot.py) saves and loads `(token_history, rng_state, position, metadata)` as plain JSON. Writes are atomic (temp file + rename), so a crash mid-save can't leave a corrupt snapshot.
+- **Worker API.** [worker/server.py](worker/server.py) exposes snapshot save/load/inspect over HTTP and validates every input at the boundary.
+- **Router.** [router/server.py](router/server.py) proxies snapshot calls to a worker and returns 502/504 when the worker is unreachable or times out.
+- **Resume test.** Generate 100 tokens, snapshot at 50, restore into a fresh process, continue. The output matches the uninterrupted run. The test uses Python's `random` as a stand-in for the sampler. Hooking up the real model is next.
 
-The core idea is simple but important:
+Not built yet:
 
-- the KV cache and in-memory execution state are ephemeral
-- the durable source of truth is the token history plus RNG state and position
-- a replacement worker can rebuild the same generation by replaying the known state and continuing deterministically
+- Worker that runs the actual model and streams tokens
+- Router-driven failover: heartbeats, detecting a dead worker, resuming the session on another one
+- Epoch fencing so a worker that comes back late can't write stale output
+- Client that reconnects to a stream without seeing duplicate or missing tokens
 
-This is a clean, small example of state recovery in a distributed AI system.
+## Run it
 
-## Status: completed vs remaining
-
-### Completed
-
-- Deterministic generation was verified against the llama2.c reference implementation.
-- Snapshot save/load support was implemented for token history, RNG state, and generation position.
-- A worker-side snapshot API was added to persist resumable state.
-- A router layer was added to proxy snapshot requests to the worker service.
-- Integration tests were added for snapshot round-trips and router forwarding.
-- The project structure was consolidated into a single repo rather than a day-by-day prototype.
-
-### Remaining
-
-- End-to-end failover orchestration across router + worker + client under real failure conditions
-- Heartbeat and epoch-based worker recovery logic for session fencing and stale message rejection
-- A more robust failover controller that handles retries, retries bounded by policy, and status transitions
-- Production-quality validation, monitoring, and error handling for recovery scenarios
-- Larger design work around model state persistence and recovery tradeoffs beyond the current minimal replay model
-
-In short: the project has already proven the hard prerequisite pieces for deterministic recovery and state capture. The remaining work is the system-level orchestration that turns this into a full fault-tolerant execution path.
-
-## Architecture
-
-```text
-client
-  |
-  v
-router
-  |
-  +--> manages session state and recovery flow
-  |
-  +--> forwards snapshot/save and resume operations to workers
-          |
-          v
-      worker(s)
-          |
-          +--> runs model inference
-          +--> emits tokens and preserves recoverable state
-```
-
-## Repository layout
-
-- engine/ — C++ runtime adapted from llama2.c
-- worker/ — snapshot logic and HTTP worker service
-- router/ — Python service that coordinates session-level recovery
-- client/ — client-facing generation flow
-- tests/ — deterministic generation, snapshot, and router validation
-- docs/ — design notes and architecture background
-- notes/ — historical day-by-day working notes retained for context
-
-## Validation
-
-The repo currently validates the core behavior with:
+Requires Python 3.10+. No dependencies outside the standard library.
 
 ```bash
-python3 -m unittest discover -v
+make test      # 16 tests
+make worker    # worker on :8001
+make router    # router on :8002, forwards to $WORKER_URL (default http://localhost:8001)
 ```
 
-The key behaviors under test include:
+Snapshots go to `worker/snapshots/` unless you set `SNAPSHOT_DIR`.
 
-- seed determinism
-- snapshot round-trip correctness
-- resume-from-snapshot continuity
-- router forwarding of snapshot operations
+## API
 
-## Design intent
+All endpoints are on both the worker and the router.
 
-This repo is intentionally small and opinionated. It is designed to answer a systems question clearly:
+| Method | Path | Body | Returns |
+| --- | --- | --- | --- |
+| POST | `/snapshot/save` | `{"token_history", "rng_state", "position"?, "metadata"?}` | `{"id"}` |
+| POST | `/snapshot/load` | `{"id"}` | full snapshot, including `rng_state` |
+| GET | `/snapshot/<id>` | | position, token count, metadata |
+| GET | `/snapshot` | | list of snapshot ids |
 
-> If the worker that is generating text disappears mid-stream, how can another worker continue without losing or duplicating output?
+`rng_state` is Python's `random.getstate()` serialized as JSON. Example:
 
-The answer here is not a production-grade serving platform. It is a focused study in deterministic replay, durable session state, and failover design decisions.
+```bash
+STATE=$(python3 -c 'import json, random; print(json.dumps(random.Random(42).getstate()))')
+curl -s -X POST localhost:8002/snapshot/save -d "{\"token_history\": [1, 2, 3], \"rng_state\": $STATE}"
+# {"id": "81e4a0a8a9d94506b09ba437505de015"}
+```
 
-## Why this project matters
+## Design notes
 
-This repo is aimed at a very specific systems question: when a generation worker fails mid-stream, how do you preserve correctness and resume without duplicating or losing output?
+- **Replay instead of shipping the KV cache.** For stories15M the full KV cache is about 3.5 MB, while 256 tokens of history is about 1 KB. Replaying costs compute on recovery but keeps the durable state tiny.
+- **JSON, not pickle.** An earlier version stored RNG state with `pickle`, which meant anyone who could reach the worker could run code on it. The state is just integers, so JSON is enough.
+- **Snapshot ids are checked before they touch the filesystem.** Only 32-char hex ids are accepted, which blocks path traversal like `../../etc/passwd`.
 
-The value here is in framing the problem cleanly and making the tradeoffs explicit: deterministic replay, durable state, and recovery strategy are all part of the design rather than afterthoughts.
+Day-by-day working notes are in [notes/](notes/).
 
 ## Credits
 
-This project builds on the work of Andrej Karpathy's llama2.c as a reference implementation for the tiny model runtime and generation loop.
-
-## Notes
-
-The early daily notes are preserved in the repo for historical context, but the project is now presented as a single coherent system design rather than a sequence of isolated day-specific snapshots.
+Model and reference runtime: Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
