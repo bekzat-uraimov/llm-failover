@@ -1,68 +1,74 @@
-import os
 import json
-import base64
-import pickle
+import os
+import random
+import re
+import tempfile
 import uuid
-from typing import Any, Dict
 
-ROOT = os.path.dirname(__file__)
-SNAPSHOT_DIR = os.path.join(ROOT, "snapshots")
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+SNAPSHOT_DIR = os.environ.get("SNAPSHOT_DIR", os.path.join(os.path.dirname(__file__), "snapshots"))
 
-
-def _encode_rng_state(rng_state: Any) -> str:
-    return base64.b64encode(pickle.dumps(rng_state)).decode("ascii")
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _decode_rng_state(b64: str) -> Any:
-    return pickle.loads(base64.b64decode(b64.encode("ascii")))
+def _path(sid: str) -> str:
+    # sid comes straight from HTTP requests; anything but a uuid4 hex could escape SNAPSHOT_DIR
+    if not isinstance(sid, str) or not _ID_RE.match(sid):
+        raise ValueError(f"invalid snapshot id: {sid!r}")
+    return os.path.join(SNAPSHOT_DIR, f"{sid}.json")
 
 
-def save_snapshot(token_history, rng_state, position: int, metadata: Dict[str, Any] = None) -> str:
-    """Save a snapshot and return the snapshot id."""
+def parse_rng_state(state) -> tuple:
+    """Turn a JSON-decoded random.getstate() back into the tuple form setstate() wants.
+
+    Raises ValueError if it isn't a valid Mersenne Twister state.
+    """
+    try:
+        version, internal, gauss = state
+        parsed = (version, tuple(internal), gauss)
+        random.Random().setstate(parsed)
+    except (TypeError, ValueError) as e:
+        raise ValueError("invalid rng_state") from e
+    return parsed
+
+
+def save_snapshot(token_history: list[int], rng_state, position: int, metadata: dict | None = None) -> str:
+    if not all(isinstance(t, int) for t in token_history):
+        raise ValueError("token_history must be a list of ints")
+    if not isinstance(position, int) or not 0 <= position <= len(token_history):
+        raise ValueError("position must be an int between 0 and len(token_history)")
+    rng_state = parse_rng_state(rng_state)
+
     sid = uuid.uuid4().hex
-    # Accept either:
-    # - a raw RNG state object (e.g. returned by random.getstate()) -> encode it
-    # - a base64-encoded pickled RNG state string (already encoded by a client)
-    if isinstance(rng_state, str):
-        # validate that the provided string decodes to a pickled object
-        try:
-            _ = _decode_rng_state(rng_state)
-        except Exception as e:
-            raise ValueError("rng_state string is not a valid base64 pickled RNG state") from e
-        rng_state_b64 = rng_state
-    else:
-        rng_state_b64 = _encode_rng_state(rng_state)
-
     data = {
         "token_history": list(token_history),
-        "rng_state": rng_state_b64,
-        "position": int(position),
+        "rng_state": rng_state,
+        "position": position,
         "metadata": metadata or {},
     }
-    path = os.path.join(SNAPSHOT_DIR, f"{sid}.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+
+    # Write to a temp file and rename, so a crash mid-write never leaves a half-written snapshot
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=SNAPSHOT_DIR, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _path(sid))
+    except BaseException:
+        os.unlink(tmp)
+        raise
     return sid
 
 
-def load_snapshot(sid: str):
-    """Load a snapshot and return (token_history, rng_state, position, metadata)."""
-    path = os.path.join(SNAPSHOT_DIR, f"{sid}.json")
-    if not os.path.exists(path):
-        raise FileNotFoundError(sid)
-    with open(path, "r", encoding="utf-8") as f:
+def load_snapshot(sid: str) -> tuple[list[int], tuple, int, dict]:
+    """Return (token_history, rng_state, position, metadata). Raises FileNotFoundError if missing."""
+    with open(_path(sid), encoding="utf-8") as f:
         data = json.load(f)
-    token_history = data["token_history"]
-    rng_state = _decode_rng_state(data["rng_state"])
-    position = int(data["position"])
-    metadata = data.get("metadata", {})
-    return token_history, rng_state, position, metadata
+    return data["token_history"], parse_rng_state(data["rng_state"]), data["position"], data["metadata"]
 
 
-def list_snapshots():
-    ids = []
-    for fn in os.listdir(SNAPSHOT_DIR):
-        if fn.endswith(".json"):
-            ids.append(fn[:-5])
-    return ids
+def list_snapshots() -> list[str]:
+    if not os.path.isdir(SNAPSHOT_DIR):
+        return []
+    return sorted(fn[:-5] for fn in os.listdir(SNAPSHOT_DIR) if fn.endswith(".json"))

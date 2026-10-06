@@ -1,90 +1,91 @@
 import json
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
-from urllib.parse import urlparse
-import os
-from . import snapshot
 import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from . import snapshot
+
+DEFAULT_PORT = 8001
 
 
-class SimpleHandler(BaseHTTPRequestHandler):
-    def _send_json(self, code, obj):
-        bs = json.dumps(obj).encode("utf-8")
+class WorkerHandler(BaseHTTPRequestHandler):
+    def _send_json(self, code: int, obj: dict):
+        body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(bs)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(bs)
+        self.wfile.write(body)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        req = json.loads(self.rfile.read(length) or b"{}")
+        if not isinstance(req, dict):
+            raise ValueError("request body must be a JSON object")
+        return req
 
     def do_GET(self):
-        p = urlparse(self.path)
-        if p.path.startswith("/snapshot/"):
-            sid = p.path[len("/snapshot/"):]
+        if self.path == "/snapshot":
+            self._send_json(200, {"snapshots": snapshot.list_snapshots()})
+            return
+        if self.path.startswith("/snapshot/"):
+            sid = self.path[len("/snapshot/"):]
             try:
-                token_history, rng_state, position, metadata = snapshot.load_snapshot(sid)
+                tokens, _, position, metadata = snapshot.load_snapshot(sid)
+            except ValueError as e:
+                self._send_json(400, {"error": str(e)})
+                return
             except FileNotFoundError:
                 self._send_json(404, {"error": "not found"})
                 return
-            # Do not return raw rng_state bytes in JSON; return metadata and length
-            self._send_json(200, {"id": sid, "position": position, "tokens": len(token_history), "metadata": metadata})
+            self._send_json(200, {"id": sid, "position": position, "tokens": len(tokens), "metadata": metadata})
             return
-        if p.path == "/snapshot":
-            ids = snapshot.list_snapshots()
-            self._send_json(200, {"snapshots": ids})
-            return
-        self._send_json(404, {"error": "unknown"})
+        self._send_json(404, {"error": "unknown path"})
 
     def do_POST(self):
-        p = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b""
-        if p.path == "/snapshot/save":
+        if self.path == "/snapshot/save":
             try:
-                req = json.loads(body.decode("utf-8")) if body else {}
-                token_history = req.get("token_history", [])
-                rng_state = req.get("rng_state")
-                # If rng_state provided as base64 pickled bytes, accept; otherwise expect None
-                if rng_state is None:
-                    rng_state = None
-                position = req.get("position", len(token_history))
-                metadata = req.get("metadata", {})
-                sid = snapshot.save_snapshot(token_history, rng_state, position, metadata)
-                self._send_json(200, {"id": sid})
-            except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                req = self._read_json()
+                if "rng_state" not in req:
+                    raise ValueError("missing rng_state")
+                tokens = req.get("token_history", [])
+                sid = snapshot.save_snapshot(
+                    tokens, req["rng_state"], req.get("position", len(tokens)), req.get("metadata")
+                )
+            except ValueError as e:
+                self._send_json(400, {"error": str(e)})
+                return
+            self._send_json(200, {"id": sid})
             return
-        if p.path == "/snapshot/load":
+        if self.path == "/snapshot/load":
             try:
-                req = json.loads(body.decode("utf-8")) if body else {}
-                sid = req.get("id")
-                if not sid:
-                    self._send_json(400, {"error": "missing id"})
-                    return
-                token_history, rng_state, position, metadata = snapshot.load_snapshot(sid)
-                # We return token history and position; rng_state is not returned raw
-                self._send_json(200, {"id": sid, "position": position, "tokens": token_history, "metadata": metadata})
+                sid = self._read_json().get("id")
+                tokens, rng_state, position, metadata = snapshot.load_snapshot(sid)
+            except ValueError as e:
+                self._send_json(400, {"error": str(e)})
+                return
             except FileNotFoundError:
                 self._send_json(404, {"error": "not found"})
-            except Exception as e:
-                self._send_json(500, {"error": str(e)})
+                return
+            self._send_json(200, {
+                "id": sid,
+                "token_history": tokens,
+                "rng_state": rng_state,
+                "position": position,
+                "metadata": metadata,
+            })
             return
-        self._send_json(404, {"error": "unknown"})
+        self._send_json(404, {"error": "unknown path"})
 
 
-def serve(port: int = 8000):
-    server = HTTPServer(("", port), SimpleHandler)
-    print(f"Worker HTTP server listening on :{port}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        server.shutdown()
+def make_server(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), WorkerHandler)
 
 
 if __name__ == "__main__":
-    p = 8000
-    if len(sys.argv) > 1:
-        try:
-            p = int(sys.argv[1])
-        except Exception:
-            pass
-    serve(p)
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
+    server = make_server(port)
+    print(f"worker listening on :{port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
