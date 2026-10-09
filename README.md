@@ -8,7 +8,7 @@ When an LLM worker dies halfway through a generation, its KV cache dies with it.
 
 Done:
 
-- **Determinism check.** Ran llama2.c twice with `-s 42` and got identical output; `-s 43` diverged. This was a manual check, written up in [notes/day1.md](notes/day1.md).
+- **Determinism check.** Ran llama2.c twice with `-s 42` and got identical output; `-s 43` diverged. This was a manual check.
 - **Snapshots.** [worker/snapshot.py](worker/snapshot.py) saves and loads `(token_history, rng_state, position, metadata)` as plain JSON. Writes are atomic (temp file + rename), so a crash mid-save can't leave a corrupt snapshot.
 - **Worker API.** [worker/server.py](worker/server.py) exposes snapshot save/load/inspect over HTTP and validates every input at the boundary.
 - **Router.** [router/server.py](router/server.py) proxies snapshot calls to a worker and returns 502/504 when the worker is unreachable or times out.
@@ -57,8 +57,6 @@ curl -s -X POST localhost:8002/snapshot/save -d "{\"token_history\": [1, 2, 3], 
 - **Replay instead of shipping the KV cache.** For stories15M the full KV cache is about 3.5 MB, while 256 tokens of history is about 1 KB. Replaying costs compute on recovery but keeps the durable state tiny.
 - **JSON, not pickle.** An earlier version stored RNG state with `pickle`, which meant anyone who could reach the worker could run code on it. The state is just integers, so JSON is enough.
 - **Snapshot ids are checked before they touch the filesystem.** Only 32-char hex ids are accepted, which blocks path traversal like `../../etc/passwd`.
-
-Day-by-day working notes are in [notes/](notes/).
 
 ## Credits
 
