@@ -12,14 +12,17 @@ Done:
 - **Snapshots.** [worker/snapshot.py](worker/snapshot.py) saves and loads `(token_history, rng_state, position, metadata)` as plain JSON. Writes are atomic (temp file + rename), so a crash mid-save can't leave a corrupt snapshot.
 - **Worker API.** [worker/server.py](worker/server.py) exposes snapshot save/load/inspect over HTTP and validates every input at the boundary.
 - **Router.** [router/server.py](router/server.py) proxies snapshot calls to a worker and returns 502/504 when the worker is unreachable or times out.
-- **Resume test.** Generate 100 tokens, snapshot at 50, restore into a fresh process, continue. The output matches the uninterrupted run. The test uses Python's `random` as a stand-in for the sampler. Hooking up the real model is next.
+- **Resume test.** Generate 100 tokens, snapshot at 50, save it to disk, load it into a new model object and continue. The output matches the uninterrupted run. The "model" here is Python's `random` standing in for the sampler, so this proves the snapshot format, not the real engine.
 
-Not built yet:
+The Python worker and router above are stand-ins that pin down the snapshot format and the API. The real worker will be C++.
 
-- Worker that runs the actual model and streams tokens
-- Router-driven failover: heartbeats, detecting a dead worker, resuming the session on another one
-- Epoch fencing so a worker that comes back late can't write stale output
-- Client that reconnects to a stream without seeing duplicate or missing tokens
+Next, in order:
+
+1. C++ engine adapted from llama2.c, with save/restore. Done when 100 tokens straight equals 50 + restore + 50 on the real model.
+2. C++ worker that streams tokens over TCP.
+3. Router keeps the session log (token, position, RNG state per step) with epochs.
+4. Heartbeats and failure detection: `kill -9` a worker mid-story and another one finishes it.
+5. CI test: SHA-256 of the failover run matches the uninterrupted run.
 
 ## Run it
 
