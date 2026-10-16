@@ -2,10 +2,12 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 import unittest
 
-from router.router import Router
+import router.router
+from router.router import MAX_RECOVERIES, Router
 from router.tokenizer import load_vocab
 from tests.test_worker import MODEL, TOKENIZER, WORKER, start_worker
 
@@ -72,21 +74,66 @@ class RouterTestCase(unittest.IsolatedAsyncioTestCase):
 @unittest.skipUnless(HAVE_WORKER, "run `make` and `make model` first")
 class RouterWithWorkersTest(RouterTestCase):
     async def asyncSetUp(self):
-        self.procs = []
-        ports = []
+        self.procs = {}  # port -> worker process
         for _ in range(2):
             proc, port = start_worker()
-            self.procs.append(proc)
-            ports.append(port)
-        await self.start_router([("127.0.0.1", p) for p in ports])
+            self.procs[port] = proc
+        await self.start_router([("127.0.0.1", p) for p in self.procs])
         await wait_until(lambda: all(w.free for w in self.router.workers))
 
     async def asyncTearDown(self):
         await super().asyncTearDown()
-        for proc in self.procs:
+        for proc in self.procs.values():
+            proc.send_signal(signal.SIGCONT)
             proc.kill()
             proc.wait()
             proc.stdout.close()
+
+    async def run_and_interrupt(self, sig: int, at_pos: int) -> tuple[list[dict], int]:
+        """Stream STORY_42, and send `sig` to whichever worker is generating it at `at_pos`."""
+        reader, writer = await connect(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
+        msgs, victim = [], None
+        try:
+            while line := await asyncio.wait_for(reader.readline(), 10):
+                msgs.append(json.loads(line))
+                if msgs[-1]["type"] in ("END", "ERROR"):
+                    break
+                if victim is None and msgs[-1].get("pos", 0) >= at_pos:
+                    (session,) = self.router.sessions.values()
+                    victim = session.worker.port
+                    self.procs[victim].send_signal(sig)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        return msgs, victim
+
+    async def test_kill_9_mid_story_gives_the_same_story(self):
+        msgs, victim = await self.run_and_interrupt(signal.SIGKILL, at_pos=40)
+
+        self.assertEqual(text_of(msgs), STORY_42)
+        (session,) = self.router.sessions.values()
+        self.assertEqual(session.state, "DONE")
+        self.assertEqual(session.epoch, 2)
+        self.assertNotEqual(session.worker.port, victim)
+        # Tokens up to the crash came from epoch 1, the rest from epoch 2, no gaps, no repeats
+        epochs = [r.epoch for r in session.log]
+        self.assertEqual(epochs, sorted(epochs))
+        self.assertEqual({1, 2}, set(epochs))
+        self.assertEqual([r.pos for r in session.log], list(range(session.log[0].pos, 101)))
+
+    async def test_frozen_worker_is_declared_dead_then_comes_back(self):
+        msgs, victim = await self.run_and_interrupt(signal.SIGSTOP, at_pos=40)
+
+        self.assertEqual(text_of(msgs), STORY_42)
+        (session,) = self.router.sessions.values()
+        self.assertEqual(session.epoch, 2)
+
+        # Thawed, it notices the router dropped it, reconnects, and is usable again
+        self.procs[victim].send_signal(signal.SIGCONT)
+        await wait_until(lambda: all(w.free for w in self.router.workers))
+        self.procs[session.worker.port].kill()
+        again = await generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
+        self.assertEqual(text_of(again), STORY_42)
 
     async def test_story_through_router_matches_llama2c(self):
         msgs = await generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
@@ -157,20 +204,27 @@ class RouterWithWorkersTest(RouterTestCase):
 
 
 class FakeWorker:
-    """Plays the worker side so a test can send exactly the messages it wants."""
+    """Plays the worker side so a test can send exactly the messages it wants.
+
+    Answers PINGs by itself unless frozen; a new connection thaws it, like a restarted worker.
+    """
 
     async def start(self):
         self.received: asyncio.Queue = asyncio.Queue()
-        self.connected = asyncio.Event()
+        self.frozen = False
         self.server = await asyncio.start_server(self.on_connect, "127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
 
     async def on_connect(self, reader, writer):
         self.writer = writer
-        self.connected.set()
+        self.frozen = False
         try:
             while line := await reader.readline():
-                await self.received.put(json.loads(line))
+                msg = json.loads(line)
+                if msg["type"] != "PING":
+                    await self.received.put(msg)
+                elif not self.frozen:
+                    writer.write(b'{"type": "PONG"}\n')
         finally:
             writer.close()
 
@@ -190,7 +244,10 @@ class RouterFencingTest(RouterTestCase):
     async def asyncSetUp(self):
         self.fake = FakeWorker()
         await self.fake.start()
-        await self.start_router([("127.0.0.1", self.fake.port)])
+        self.reconnect_delay = router.router.RECONNECT_DELAY
+        router.router.RECONNECT_DELAY = 0.05
+        # Dead after 3 x 50 ms of silence, to keep the tests quick
+        await self.start_router([("127.0.0.1", self.fake.port)], ping_interval=0.05)
         await wait_until(lambda: self.router.workers[0].free)
         vocab = load_vocab(TOKENIZER)
         self.once, self.upon, self.a, self.time = (vocab.index(w) for w in (b" Once", b" upon", b" a", b" time"))
@@ -198,6 +255,7 @@ class RouterFencingTest(RouterTestCase):
     async def asyncTearDown(self):
         await super().asyncTearDown()
         await self.fake.close()
+        router.router.RECONNECT_DELAY = self.reconnect_delay
 
     async def begin(self) -> tuple[asyncio.Task, str, int]:
         client = asyncio.create_task(generate(self.port, {"prompt": "Once", "seed": 5}))
@@ -245,19 +303,65 @@ class RouterFencingTest(RouterTestCase):
         await wait_until(lambda: self.router.dropped == 1)
         self.assertEqual(self.router.sessions[sid].tokens, [1, self.once])
 
-    async def test_worker_disconnect_fails_the_session(self):
+    async def test_lost_worker_gets_a_resume_built_from_the_log(self):
         client, sid, epoch = await self.begin()
         self.fake.send(type="TOKEN", session=sid, epoch=epoch, pos=2, token=self.upon, rng_state=11)
         await wait_until(lambda: len(self.router.sessions[sid].log) == 1)
 
         self.fake.writer.close()
+        resume = await self.fake.recv()
+
+        self.assertEqual(resume, {"type": "RESUME", "session": sid, "epoch": epoch + 1,
+                                  "tokens": [1, self.once, self.upon], "rng_state": 11})
+        self.fake.send(type="RESUMED", session=sid, epoch=epoch + 1, pos=3, replay_ms=1.0)
+        self.fake.send(type="TOKEN", session=sid, epoch=epoch + 1, pos=3, token=self.a, rng_state=12)
+        self.fake.send(type="DONE", session=sid, epoch=epoch + 1, reason="steps")
+        msgs = await client
+        self.assertEqual(text_of(msgs), "Once upon a")
+        self.assertEqual([r.epoch for r in self.router.sessions[sid].log], [1, 2])
+
+    async def test_silent_worker_is_declared_dead_and_its_old_epoch_is_fenced_off(self):
+        client, sid, epoch = await self.begin()
+        self.fake.frozen = True
+
+        # 3 missed pings later the router hangs up on it and, once it's back, resumes there
+        resume = await self.fake.recv()
+        self.assertEqual((resume["type"], resume["epoch"]), ("RESUME", epoch + 1))
+
+        # A token the worker generated under the old assignment arrives late: dropped
+        self.fake.send(type="TOKEN", session=sid, epoch=epoch, pos=2, token=self.time, rng_state=99)
+        self.fake.send(type="TOKEN", session=sid, epoch=epoch + 1, pos=2, token=self.upon, rng_state=11)
+        self.fake.send(type="DONE", session=sid, epoch=epoch + 1, reason="steps")
         msgs = await client
 
+        self.assertEqual(text_of(msgs), "Once upon")
+        self.assertEqual(self.router.dropped, 1)
+
+    async def test_lost_before_started_starts_over(self):
+        client = asyncio.create_task(generate(self.port, {"prompt": "Once", "seed": 5}))
+        first = await self.fake.recv()
+        self.fake.writer.close()
+
+        second = await self.fake.recv()
+
+        # Nothing was committed, so there is nothing to replay: same START, next epoch
+        self.assertEqual(second, {**first, "epoch": first["epoch"] + 1})
+        self.fake.send(type="STARTED", session=second["session"], epoch=second["epoch"], tokens=[1, self.once])
+        self.fake.send(type="DONE", session=second["session"], epoch=second["epoch"], reason="eos")
+        self.assertEqual(text_of(await client), "Once")
+
+    async def test_session_fails_after_max_recoveries(self):
+        client, sid, epoch = await self.begin()
+        for _ in range(MAX_RECOVERIES):
+            self.fake.writer.close()
+            self.assertEqual((await self.fake.recv())["type"], "RESUME")
+        self.fake.writer.close()
+
+        msgs = await client
         self.assertEqual(msgs[-1]["type"], "ERROR")
-        self.assertIn("disconnected", msgs[-1]["error"])
+        self.assertIn("gave up", msgs[-1]["error"])
         self.assertEqual(self.router.sessions[sid].state, "FAILED")
-        # What was committed before the crash stays in the log; that's what recovery will replay
-        self.assertEqual(len(self.router.sessions[sid].log), 1)
+        self.assertEqual(self.router.sessions[sid].epoch, MAX_RECOVERIES + 1)
 
     async def test_worker_error_is_passed_to_the_client(self):
         client, sid, epoch = await self.begin()

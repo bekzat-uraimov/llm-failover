@@ -6,6 +6,10 @@ A token is committed when the router appends it to the session log, and the clie
 ever sees committed tokens. Every assignment of a session to a worker gets a new epoch.
 A token is accepted only if its session, epoch and position are exactly what the log
 expects next; everything else is dropped.
+
+The router PINGs every worker every 200 ms. A worker that stays silent for 3 pings, or
+whose connection drops, is dead. Its session is handed to another worker with the next
+epoch, and that worker replays the log and continues from the last committed token.
 """
 
 import argparse
@@ -13,6 +17,7 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from dataclasses import dataclass, field
 
 from router.tokenizer import decode, load_vocab
@@ -20,6 +25,9 @@ from router.tokenizer import decode, load_vocab
 log = logging.getLogger("router")
 
 RECONNECT_DELAY = 0.5
+PING_INTERVAL = 0.2
+MISSED_PINGS = 3
+MAX_RECOVERIES = 3
 
 
 @dataclass
@@ -37,11 +45,18 @@ class Session:
     seed: int
     steps: int | None
     out: asyncio.Queue = field(default_factory=asyncio.Queue)  # committed messages for the client
-    state: str = "START"  # START -> RUNNING -> DONE, or STOPPED / FAILED
+    state: str = "START"  # START -> RUNNING <-> RECOVERING, then DONE, STOPPED or FAILED
     epoch: int = 0
     worker: "Worker | None" = None
     tokens: list[int] = field(default_factory=list)  # prompt + every committed token
     log: list[Record] = field(default_factory=list)
+    recoveries: int = 0
+    lost_at: float = 0.0
+
+    @property
+    def rng_state(self) -> int:
+        # After the last committed token; before any token is sampled it's still the seed
+        return self.log[-1].rng_state if self.log else self.seed
 
 
 class Worker:
@@ -53,6 +68,10 @@ class Worker:
         self.port = port
         self.writer: asyncio.StreamWriter | None = None
         self.session: Session | None = None
+        # Only true once the worker has answered on this connection. A frozen process still
+        # accepts TCP connections (the kernel does the handshake), so connecting proves nothing.
+        self.ready = False
+        self.last_seen = 0.0
 
     @property
     def name(self) -> str:
@@ -60,7 +79,7 @@ class Worker:
 
     @property
     def free(self) -> bool:
-        return self.writer is not None and self.session is None
+        return self.ready and self.session is None
 
     def send(self, msg: dict):
         self.writer.write(json.dumps(msg).encode() + b"\n")
@@ -72,38 +91,69 @@ class Worker:
             except OSError:
                 await asyncio.sleep(RECONNECT_DELAY)
                 continue
-            log.info("worker %s connected", self.name)
-            self.router.worker_freed()
+            self.last_seen = time.monotonic()
+            beat = asyncio.create_task(self.heartbeat())
             try:
                 while line := await reader.readline():
+                    self.last_seen = time.monotonic()
+                    if not self.ready:
+                        self.ready = True
+                        log.info("worker %s ready", self.name)
+                        self.router.worker_freed()
                     self.router.on_worker_message(self, json.loads(line))
             except (OSError, ValueError, KeyError, TypeError) as e:
                 # A malformed message means something is badly wrong with that worker; reconnect
                 log.warning("worker %s: %r", self.name, e)
             finally:
+                beat.cancel()
                 self.writer.close()
                 self.writer = None
-                self.router.on_worker_lost(self)
+                was_ready, self.ready = self.ready, False
+                self.router.on_worker_lost(self, was_ready)
+
+    async def heartbeat(self):
+        interval = self.router.ping_interval
+        while True:
+            silent = time.monotonic() - self.last_seen
+            if silent > interval * self.router.missed_pings:
+                if self.ready:
+                    log.warning("worker %s silent for %.0f ms, declaring it dead", self.name, silent * 1000)
+                # abort(), not close(): close() waits to flush, and a hung worker never reads
+                self.writer.transport.abort()
+                return
+            self.send({"type": "PING"})
+            await asyncio.sleep(interval)
 
 
 class Router:
-    def __init__(self, workers: list[tuple[str, int]], vocab: list[bytes], worker_timeout: float = 10.0):
+    def __init__(self, workers: list[tuple[str, int]], vocab: list[bytes], worker_timeout: float = 10.0,
+                 ping_interval: float = PING_INTERVAL, missed_pings: int = MISSED_PINGS):
         self.vocab = vocab
         self.workers = [Worker(self, host, port) for host, port in workers]
         self.worker_timeout = worker_timeout
+        self.ping_interval = ping_interval
+        self.missed_pings = missed_pings
         self.sessions: dict[str, Session] = {}
         self.dropped = 0
         self._freed = asyncio.Event()
-        self._tasks: list[asyncio.Task] = []
+        self._tasks: set[asyncio.Task] = set()
 
     async def start(self, host: str, port: int) -> asyncio.Server:
-        self._tasks = [asyncio.create_task(w.run()) for w in self.workers]
+        for w in self.workers:
+            self.spawn(w.run())
         return await asyncio.start_server(self.handle_client, host, port)
 
+    def spawn(self, coro):
+        # asyncio only keeps weak references to tasks, so hold on to them until they finish
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     async def close(self):
-        for t in self._tasks:
+        tasks = list(self._tasks)
+        for t in tasks:
             t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     # Client side
 
@@ -194,14 +244,43 @@ class Router:
         session.state = "RUNNING"
         session.worker = worker
         worker.session = session
-        msg = {"type": "START", "session": session.id, "epoch": session.epoch,
-               "prompt": session.prompt, "seed": session.seed}
+        msg = {"session": session.id, "epoch": session.epoch}
+        if session.tokens:
+            # Recovery. The log is the whole state: the worker replays it and carries on.
+            msg |= {"type": "RESUME", "tokens": session.tokens, "rng_state": session.rng_state}
+        else:
+            msg |= {"type": "START", "prompt": session.prompt, "seed": session.seed}
         if session.steps is not None:
             msg["steps"] = session.steps
         worker.send(msg)
-        log.info("session %s epoch %d -> worker %s", session.id, session.epoch, worker.name)
+        log.info("session %s epoch %d -> worker %s (%s)", session.id, session.epoch, worker.name, msg["type"])
+
+    def recover(self, session: Session, reason: str):
+        session.worker = None
+        if session.recoveries >= MAX_RECOVERIES:
+            self.fail(session, f"{reason}, gave up after {MAX_RECOVERIES} recoveries")
+            return
+        session.recoveries += 1
+        session.state = "RECOVERING"
+        session.lost_at = time.monotonic()
+        log.warning("session %s recovering at pos %d: %s", session.id, len(session.tokens), reason)
+        self.spawn(self.reassign(session))
+
+    async def reassign(self, session: Session):
+        try:
+            worker = await asyncio.wait_for(self.acquire(), self.worker_timeout)
+        except asyncio.TimeoutError:
+            if session.state == "RECOVERING":
+                self.fail(session, "no worker left to recover on")
+            return
+        # The client may have hung up while we waited
+        if session.state == "RECOVERING":
+            self.assign(session, worker)
 
     def stop(self, session: Session):
+        if session.state == "RECOVERING":
+            session.state = "STOPPED"
+            return
         if session.state != "RUNNING":
             return
         session.state = "STOPPED"
@@ -256,6 +335,10 @@ class Router:
             # Prompt tokens come from the client's own text, so they're committed as-is
             for pos in range(1, len(session.tokens)):
                 self.emit_text(session, pos)
+        elif kind == "RESUMED":
+            log.info("session %s resumed on %s at pos %d: replay %.0f ms, %.0f ms after the worker was lost",
+                     session.id, worker.name, msg["pos"], msg["replay_ms"],
+                     (time.monotonic() - session.lost_at) * 1000)
         elif kind == "TOKEN":
             self.commit(session, msg)
         elif kind == "DONE":
@@ -283,13 +366,13 @@ class Router:
         self.dropped += 1
         log.warning("dropped %s (%s)", msg, reason)
 
-    def on_worker_lost(self, worker: Worker):
-        log.warning("worker %s disconnected", worker.name)
+    def on_worker_lost(self, worker: Worker, was_ready: bool):
+        if was_ready:
+            log.warning("worker %s lost", worker.name)
         session = worker.session
         worker.session = None
-        # Recovering on another worker is the next step; for now the session just fails
         if session and session.state == "RUNNING":
-            self.fail(session, f"worker {worker.name} disconnected")
+            self.recover(session, f"worker {worker.name} lost")
 
 
 def parse_addr(addr: str) -> tuple[str, int]:
