@@ -13,13 +13,14 @@ Done:
 - **Worker** ([worker/worker.cpp](worker/worker.cpp)). TCP server that streams tokens as JSON lines. It answers `PING` and `STOP` between tokens, so it stays responsive mid-generation.
 - **Cross-process resume.** Worker A streams 100 tokens. Worker B, a separate process, gets the first 50 via `RESUME` and produces the same last 50 tokens, positions and RNG states ([tests/test_worker.py](tests/test_worker.py)).
 - **Router** ([router/router.py](router/router.py)). Python asyncio. Clients talk only to the router, which hands each session to a free worker and keeps the session log: epoch, position, token and RNG state for every token. A token is *committed* when it's in the log, and the client only ever sees committed tokens. A token is accepted only if its session, epoch and position are exactly what the log expects next. Duplicates, gaps, old epochs and sessions the worker doesn't own are dropped ([tests/test_router.py](tests/test_router.py)).
+- **Failover.** The router `PING`s every worker every 200 ms. A worker whose connection drops, or that stays silent for 3 pings (about 600 ms), is declared dead. Its session goes to another worker with the next epoch, as a `RESUME` built from the log. `kill -9` and `SIGSTOP` on the generating worker mid-story both give a story byte-identical to the uninterrupted run (see the demo below). A session gives up after 3 recoveries.
 - **Client** ([client/client.py](client/client.py)). Sends a prompt to the router and prints the story as it streams.
 
 Next, in order:
 
-1. Heartbeats and recovery: `PING` every 200 ms, a worker is dead after 3 misses, and the router replays the log to another worker with the next epoch. Done when `kill -9` on a worker mid-story doesn't change the story. Right now a lost worker just fails the session, though the committed log survives.
-2. CI test: SHA-256 of the failover run matches the uninterrupted run.
-3. Measurements, including replay cost vs context length.
+1. CI test: SHA-256 of the failover run matches the uninterrupted run, in GitHub Actions.
+2. Measurements: tokens per second, failover pause, replay cost vs context length.
+3. Two cloud servers, kill test over a real network.
 
 ## Run it
 
@@ -45,6 +46,26 @@ Timmy's mom saw him and said, "Timmy, that ring is not yours. You should give it
 ```
 
 Same output as `./run stories15M.bin -s 42 -n 100 -i "Once upon a time"` in llama2.c.
+
+## Failover demo
+
+Same setup, `--steps 256`, and `kill -9` on the worker generating the story partway through. Router log:
+
+```
+22:25:33,998 session ee94f22a epoch 1 -> worker 127.0.0.1:9001 (START)
+22:25:34,506 worker 127.0.0.1:9001 lost
+22:25:34,506 session ee94f22a recovering at pos 79: worker 127.0.0.1:9001 lost
+22:25:34,506 session ee94f22a epoch 2 -> worker 127.0.0.1:9002 (RESUME)
+22:25:34,998 session ee94f22a resumed on 127.0.0.1:9002 at pos 79: replay 491 ms, 492 ms after the worker was lost
+22:25:35,847 session ee94f22a done: 210 tokens
+```
+
+```
+54697c5fa152fd51cccf4d68e9f2618c6848e65292390b45e27270eff086c585  llama2.c, uninterrupted
+54697c5fa152fd51cccf4d68e9f2618c6848e65292390b45e27270eff086c585  through the router, worker killed at token 79
+```
+
+A killed process closes its socket, so the router notices right away. A frozen one (`kill -STOP`) keeps the socket open; the heartbeat catches it instead, about 700 ms after its last answer. Both cases are in [tests/test_router.py](tests/test_router.py).
 
 ## Protocol
 
@@ -85,6 +106,9 @@ Every `TOKEN` carries the RNG state *after* that token was sampled. A log of `TO
 - **One session per worker, one thread.** Between tokens the worker polls its socket without blocking. That keeps `PING` latency under one token's time without threads or locks.
 - **Log first, then the client.** Every token takes one extra hop through the router before the client sees it. That costs latency, but it means the client can never have seen a token that isn't in the log, so recovery can't produce a story that contradicts what the client already printed.
 - **Epochs fence off old workers.** Each assignment of a session gets a new epoch, and anything sent under an old one is dropped. A worker that comes back after being declared dead can't write into a session that has moved on.
+- **Replay doesn't block the heartbeat.** Replaying 79 tokens takes about 500 ms, and a full 256-token context longer than the 600 ms a worker may stay silent. So the worker replays one position per loop and answers `PING`s in between, the same way it does while generating. Otherwise the heartbeat would kill the worker doing the recovery.
+- **Connected doesn't mean alive.** The kernel completes a TCP handshake even for a frozen process. After reconnecting, a worker only gets sessions once it has answered a message.
+- **Heartbeat timeout is a tradeoff.** 600 ms means a frozen worker costs well under a second. Shorter would recover faster but would also kill workers that are just slow for a moment.
 - **The router is a single point of failure.** Its log lives in memory. Worker failure is the focus here; replicating the router is out of scope.
 
 ## Credits
