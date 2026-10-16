@@ -8,59 +8,71 @@ When an LLM worker dies halfway through a generation, its KV cache dies with it.
 
 Done:
 
-- **Determinism check.** Ran llama2.c twice with `-s 42` and got identical output; `-s 43` diverged. This was a manual check.
-- **Snapshots.** [worker/snapshot.py](worker/snapshot.py) saves and loads `(token_history, rng_state, position, metadata)` as plain JSON. Writes are atomic (temp file + rename), so a crash mid-save can't leave a corrupt snapshot.
-- **Worker API.** [worker/server.py](worker/server.py) exposes snapshot save/load/inspect over HTTP and validates every input at the boundary.
-- **Router.** [router/server.py](router/server.py) proxies snapshot calls to a worker and returns 502/504 when the worker is unreachable or times out.
-- **Resume test.** Generate 100 tokens, snapshot at 50, save it to disk, load it into a new model object and continue. The output matches the uninterrupted run. The "model" here is Python's `random` standing in for the sampler, so this proves the snapshot format, not the real engine.
-
-The Python worker and router above are stand-ins that pin down the snapshot format and the API. The real worker will be C++.
+- **Engine** ([engine/](engine/)). llama2.c's forward pass, tokenizer and sampler wrapped in a C++ `Engine` class with `save()` and `restore()`. `restore()` rebuilds the KV cache by replaying the token history, then sets the RNG state. Output is byte-identical to llama2.c's own `run` for the same seed and prompt (checked by hand on 5 seed/prompt pairs, including one that hits the UTF-8 byte fallback).
+- **Save/restore proof.** Generate 100 tokens straight, or generate 50, restore into a *different* engine and generate 50 more. Both give the same 100 tokens ([engine/test_engine.cpp](engine/test_engine.cpp)).
+- **Worker** ([worker/worker.cpp](worker/worker.cpp)). TCP server that streams tokens as JSON lines. It answers `PING` and `STOP` between tokens, so it stays responsive mid-generation.
+- **Cross-process resume.** Worker A streams 100 tokens. Worker B, a separate process, gets the first 50 via `RESUME` and produces the same last 50 tokens, positions and RNG states ([tests/test_worker.py](tests/test_worker.py)).
+- **Client** ([client/client.py](client/client.py)). Sends a prompt and prints the story as it streams.
 
 Next, in order:
 
-1. C++ engine adapted from llama2.c, with save/restore. Done when 100 tokens straight equals 50 + restore + 50 on the real model.
-2. C++ worker that streams tokens over TCP.
-3. Router keeps the session log (token, position, RNG state per step) with epochs.
-4. Heartbeats and failure detection: `kill -9` a worker mid-story and another one finishes it.
-5. CI test: SHA-256 of the failover run matches the uninterrupted run.
+1. Router keeps the session log (token, position, RNG state per step) with epochs. Client talks only to the router.
+2. Heartbeats and failure detection: `kill -9` a worker mid-story and another one finishes it.
+3. CI test: SHA-256 of the failover run matches the uninterrupted run.
+4. Measurements, including replay cost vs context length.
 
 ## Run it
 
-Requires Python 3.10+. No dependencies outside the standard library.
+Needs a C++17 compiler and Python 3.10+. No other dependencies.
 
 ```bash
-make test      # 16 tests
-make worker    # worker on :8001
-make router    # router on :8002, forwards to $WORKER_URL (default http://localhost:8001)
+make model     # downloads stories15M.bin (60 MB) and tokenizer.bin into models/
+make test      # C++ engine tests + Python tests
+make worker    # worker on 127.0.0.1:9001
 ```
 
-Snapshots go to `worker/snapshots/` unless you set `SNAPSHOT_DIR`.
-
-## API
-
-All endpoints are on both the worker and the router.
-
-| Method | Path | Body | Returns |
-| --- | --- | --- | --- |
-| POST | `/snapshot/save` | `{"token_history", "rng_state", "position"?, "metadata"?}` | `{"id"}` |
-| POST | `/snapshot/load` | `{"id"}` | full snapshot, including `rng_state` |
-| GET | `/snapshot/<id>` | | position, token count, metadata |
-| GET | `/snapshot` | | list of snapshot ids |
-
-`rng_state` is Python's `random.getstate()` serialized as JSON. Example:
+In another terminal:
 
 ```bash
-STATE=$(python3 -c 'import json, random; print(json.dumps(random.Random(42).getstate()))')
-curl -s -X POST localhost:8002/snapshot/save -d "{\"token_history\": [1, 2, 3], \"rng_state\": $STATE}"
-# {"id": "81e4a0a8a9d94506b09ba437505de015"}
+python3 -m client.client --prompt "Once upon a time" --seed 42 --steps 100
 ```
+
+```
+Once upon a time, there was a boy named Timmy. Timmy loved to play with his toys. One day, he found a shiny thing on the ground. It was a ring with a pointy end. Timmy put it on his finger and said, "I think this is mine now."
+Timmy's mom saw him and said, "Timmy, that ring is not yours. You should give it back." Timmy didn't want to give it
+```
+
+Same output as `./run stories15M.bin -s 42 -n 100 -i "Once upon a time"` in llama2.c.
+
+## Worker protocol
+
+One JSON object per line, over TCP. `steps` means the same as llama2.c's `-n`: the number of forward passes, prompt included (max 256).
+
+| Direction | Message | Fields |
+| --- | --- | --- |
+| → worker | `START` | `session, epoch, prompt, seed, steps?` |
+| → worker | `RESUME` | `session, epoch, tokens, rng_state, steps?` |
+| → worker | `STOP` | `session` |
+| → worker | `PING` | |
+| worker → | `STARTED` | `session, epoch, tokens` (the prompt, encoded) |
+| worker → | `RESUMED` | `session, epoch, pos, replay_ms` |
+| worker → | `TOKEN` | `session, epoch, pos, token, rng_state` |
+| worker → | `DONE` | `session, epoch, reason` (`steps` or `eos`) |
+| worker → | `STOPPED` | `session` |
+| worker → | `PONG` | |
+| worker → | `ERROR` | `error` |
+
+Every `TOKEN` carries the RNG state *after* that token was sampled. A log of `TOKEN`s is enough to resume on another worker: send the tokens so far plus the last `rng_state` in a `RESUME`.
 
 ## Design notes
 
-- **Replay instead of shipping the KV cache.** For stories15M the full KV cache is about 3.5 MB, while 256 tokens of history is about 1 KB. Replaying costs compute on recovery but keeps the durable state tiny.
-- **JSON, not pickle.** An earlier version stored RNG state with `pickle`, which meant anyone who could reach the worker could run code on it. The state is just integers, so JSON is enough.
-- **Snapshot ids are checked before they touch the filesystem.** Only 32-char hex ids are accepted, which blocks path traversal like `../../etc/passwd`.
+- **Replay instead of shipping the KV cache.** For stories15M the full KV cache is about 3.5 MB (6 layers × 256 positions × 288 dims × K and V × 4 bytes). 256 tokens of history is about 1 KB. Replaying costs compute on recovery but keeps the durable state tiny.
+- **Determinism has conditions.** Same weights, tokenizer, binary and CPU architecture on every worker. The matmul is single threaded so the float summation order never changes, and the build doesn't use `-ffast-math`, which would let the compiler reorder float math. This is not a claim of determinism across arbitrary hardware.
+- **64-bit RNG state over JSON.** The worker's JSON reader keeps numbers as text, so `rng_state` round-trips all 64 bits. A double would silently drop the low bits past 2^53.
+- **One session per worker, one thread.** Between tokens the worker polls its socket without blocking. That keeps `PING` latency under one token's time without threads or locks.
+
+`worker/server.py`, `worker/snapshot.py` and `router/server.py` are the first Python prototype: an HTTP snapshot store and proxy. The router in step 1 replaces them.
 
 ## Credits
 
-Model and reference runtime: Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
+Model, tokenizer and the inference code in [engine/engine.cpp](engine/engine.cpp) come from Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) (MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
