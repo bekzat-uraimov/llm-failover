@@ -3,8 +3,9 @@ CXXFLAGS = -std=c++17 -O2 -Wall -Wextra
 
 MODEL = models/stories15M.bin
 TOKENIZER = models/tokenizer.bin
+PORT = 9001
 
-.PHONY: all model test worker clean
+.PHONY: all model test worker router clean
 
 all: build/worker build/test_engine
 
@@ -31,7 +32,10 @@ test: all model
 	python3 -m unittest discover -v
 
 worker: build/worker model
-	./build/worker
+	./build/worker --port $(PORT)
+
+router: model
+	python3 -m router.router --worker 127.0.0.1:9001 --worker 127.0.0.1:9002
 
 clean:
 	rm -rf build
