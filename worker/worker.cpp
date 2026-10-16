@@ -2,7 +2,9 @@
 // Protocol is one JSON object per line in both directions; README.md lists the messages.
 //
 // Single threaded on purpose. Between tokens the worker polls the socket without blocking,
-// so a PING or STOP is answered within one token's time even mid-generation.
+// so a PING or STOP is answered within one token's time even mid-generation. Replaying a
+// history after RESUME works the same way, one position per loop, so the router's heartbeat
+// keeps getting answers while a long recovery runs.
 
 #include "../engine/engine.h"
 #include "json.h"
@@ -30,6 +32,8 @@ struct Session {
     std::string id;
     int64_t epoch;
     int steps;  // stop once this many forward passes have run, same meaning as llama2.c's -n
+    bool resuming = false;
+    std::chrono::steady_clock::time_point replay_start{};
 };
 
 std::string tokens_json(const std::vector<int>& tokens) {
@@ -135,7 +139,12 @@ private:
 
     void start(const Json& msg) {
         Session s = new_session(msg);
-        engine_.start(msg.at("prompt").as_string(), msg.at("seed").as_uint());
+        uint64_t seed = msg.at("seed").as_uint();
+        if (seed == 0) throw std::invalid_argument("seed must be non-zero");
+        std::vector<int> tokens = engine_.encode(msg.at("prompt").as_string());
+        if (static_cast<int>(tokens.size()) > engine_.seq_len()) throw std::invalid_argument("prompt too long");
+        // The prompt goes through the model in step(), one position per loop, like a resume
+        engine_.begin_restore({tokens, static_cast<int>(tokens.size()), seed});
         session_ = s;
         // The router needs the prompt tokens to build its log; it has no tokenizer of its own
         send_line(header("STARTED", s) + ",\"tokens\":" + tokens_json(engine_.tokens()) + "}");
@@ -154,16 +163,22 @@ private:
         state.pos = msg.has("pos") ? static_cast<int>(msg.at("pos").as_int()) : static_cast<int>(state.tokens.size());
         state.rng_state = msg.at("rng_state").as_uint();
 
-        auto t0 = std::chrono::steady_clock::now();
-        engine_.restore(state);
-        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-
+        engine_.begin_restore(state);
+        s.resuming = true;
+        s.replay_start = std::chrono::steady_clock::now();
         session_ = s;
-        char replay[32];
-        std::snprintf(replay, sizeof replay, "%.2f", ms);
-        send_line(header("RESUMED", s) + ",\"pos\":" + std::to_string(state.pos) + ",\"replay_ms\":" + replay + "}");
-        std::fprintf(stderr, "session %s epoch %lld: resumed at pos %d, replay took %s ms\n", s.id.c_str(),
-                     static_cast<long long>(s.epoch), state.pos, replay);
+        if (!engine_.replaying()) resumed();
+    }
+
+    void resumed() {
+        auto elapsed = std::chrono::steady_clock::now() - session_->replay_start;
+        char ms[32];
+        std::snprintf(ms, sizeof ms, "%.2f", std::chrono::duration<double, std::milli>(elapsed).count());
+        int pos = static_cast<int>(engine_.tokens().size());
+        send_line(header("RESUMED", *session_) + ",\"pos\":" + std::to_string(pos) + ",\"replay_ms\":" + ms + "}");
+        std::fprintf(stderr, "session %s epoch %lld: resumed at pos %d, replay took %s ms\n", session_->id.c_str(),
+                     static_cast<long long>(session_->epoch), pos, ms);
+        session_->resuming = false;
     }
 
     void stop(const Json& msg) {
@@ -180,6 +195,11 @@ private:
     }
 
     void step() {
+        if (engine_.replaying()) {
+            engine_.replay_step();
+            if (!engine_.replaying() && session_->resuming) resumed();
+            return;
+        }
         if (static_cast<int>(engine_.tokens().size()) - 1 >= session_->steps) {
             finish("steps");
             return;

@@ -428,10 +428,12 @@ void Engine::start(const std::string& prompt, uint64_t seed) {
 }
 
 int Engine::next_token() {
-    int pos = static_cast<int>(tokens_.size()) - 1;  // position of the last token, the one we feed in
-    if (pos < 0) throw std::logic_error("next_token() before start() or restore()");
+    if (tokens_.empty()) throw std::logic_error("next_token() before start() or restore()");
+    if (replaying()) throw std::logic_error("next_token() while still replaying");
+    int pos = static_cast<int>(cached_);  // position of the last token, the one we feed in
     if (pos >= config_.seq_len) throw std::out_of_range("context is full");
     int next = sample(forward(tokens_.back(), pos));
+    cached_++;
     tokens_.push_back(next);
     return next;
 }
@@ -441,6 +443,11 @@ EngineState Engine::save() const {
 }
 
 void Engine::restore(const EngineState& s) {
+    begin_restore(s);
+    while (replaying()) replay_step();
+}
+
+void Engine::begin_restore(const EngineState& s) {
     if (s.tokens.empty() || s.tokens[0] != BOS) throw std::invalid_argument("tokens must start with BOS");
     if (s.pos != static_cast<int>(s.tokens.size())) throw std::invalid_argument("pos must equal len(tokens)");
     if (static_cast<int>(s.tokens.size()) > config_.seq_len + 1) throw std::invalid_argument("too many tokens");
@@ -449,12 +456,17 @@ void Engine::restore(const EngineState& s) {
     }
     if (s.rng_state == 0) throw std::invalid_argument("rng_state must be non-zero");
 
-    // Rebuild the KV cache by running every token except the last through the model.
-    // Same inputs in the same order as the original run, so the cache is bit for bit the same.
-    // The last token goes in on the next next_token() call, just like during generation.
     tokens_ = s.tokens;
-    for (size_t pos = 0; pos + 1 < tokens_.size(); pos++) {
-        forward(tokens_[pos], static_cast<int>(pos));
-    }
+    cached_ = 0;
     rng_state_ = s.rng_state;
+}
+
+// Rebuild the KV cache one position at a time by running every token except the last
+// through the model. Same inputs in the same order as the original run, so the cache comes
+// out bit for bit the same. The last token goes in on the next next_token() call, just like
+// during generation. Replay never samples, so the RNG state set in begin_restore() is untouched.
+void Engine::replay_step() {
+    if (!replaying()) throw std::logic_error("nothing to replay");
+    forward(tokens_[cached_], static_cast<int>(cached_));
+    cached_++;
 }

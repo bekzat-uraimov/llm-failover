@@ -115,6 +115,24 @@ class WorkerTest(unittest.TestCase):
         self.assertEqual(rest, expected)
         self.assertTrue(all(m["epoch"] == 2 for m in tokens_of(resumed)))
 
+    def test_ping_is_answered_mid_replay(self):
+        msgs = self.generate(self.conn, seed=7, steps=200)
+        tokens = msgs[0]["tokens"] + [m["token"] for m in tokens_of(msgs)]
+        self.assertGreater(len(tokens), 100)
+
+        # Replaying 100+ positions takes far longer than the router's 600 ms heartbeat budget
+        # allows a worker to go silent, so the worker has to answer while it replays
+        self.conn.send({"type": "RESUME", "session": "r", "epoch": 2, "tokens": tokens,
+                        "rng_state": tokens_of(msgs)[-1]["rng_state"]})
+        self.conn.send({"type": "PING"})
+
+        self.assertEqual(self.conn.recv(), {"type": "PONG"})
+        resumed = self.conn.recv()
+        self.assertEqual(resumed["type"], "RESUMED")
+        self.assertEqual(resumed["pos"], len(tokens))
+        self.conn.send({"type": "STOP", "session": "r"})
+        self.conn.recv_until("STOPPED")
+
     def test_ping_is_answered_mid_generation(self):
         self.conn.send({"type": "START", "session": "s", "epoch": 1, "prompt": PROMPT, "seed": 42})
         self.conn.send({"type": "PING"})

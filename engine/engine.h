@@ -28,6 +28,13 @@ public:
     EngineState save() const;
     void restore(const EngineState& s);  // replay tokens through forward, then set rng
 
+    // restore() split up, so a caller can stay responsive while a long history replays:
+    // begin_restore(s); while (replaying()) replay_step();
+    void begin_restore(const EngineState& s);
+    bool replaying() const { return cached_ + 1 < tokens_.size(); }
+    void replay_step();
+
+    std::vector<int> encode(const std::string& text) const;
     std::string decode(int prev, int token) const;
     const std::vector<int>& tokens() const { return tokens_; }
     int seq_len() const { return config_.seq_len; }
@@ -74,7 +81,6 @@ private:
     void load_tokenizer(const std::string& path);
     float* forward(int token, int pos);
     int sample(float* logits);
-    std::vector<int> encode(const std::string& text) const;
     int lookup(const std::string& piece) const;
 
     Config config_{};
@@ -93,5 +99,6 @@ private:
     std::vector<ProbIndex> probindex_;
 
     std::vector<int> tokens_;
+    size_t cached_ = 0;  // positions already in the KV cache
     uint64_t rng_state_ = 0;
 };

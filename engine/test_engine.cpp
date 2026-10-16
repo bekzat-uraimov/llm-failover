@@ -104,6 +104,24 @@ void test_save_reports_position_and_rng() {
     CHECK(s2.rng_state != 42);
 }
 
+void test_step_by_step_replay_matches_restore() {
+    Engine a(model_path, tokenizer_path), b(model_path, tokenizer_path);
+    a.start(PROMPT, 42);
+    generate(a, 40);
+    EngineState saved = a.save();
+    std::vector<int> expected = generate(a, 30);
+
+    b.begin_restore(saved);
+    int steps = 0;
+    while (b.replaying()) {
+        CHECK(throws([&] { b.next_token(); }));  // the cache isn't rebuilt yet
+        b.replay_step();
+        steps++;
+    }
+    CHECK(steps == saved.pos - 1);
+    CHECK(generate(b, 30) == expected);
+}
+
 void test_restore_rejects_bad_state() {
     Engine e(model_path, tokenizer_path);
     CHECK(throws([&] { e.restore({{}, 0, 1}); }));                  // empty
@@ -139,6 +157,7 @@ int main(int argc, char** argv) {
         {"restore_rewinds_same_engine", test_restore_rewinds_same_engine},
         {"restore_with_only_the_prompt", test_restore_with_only_the_prompt},
         {"save_reports_position_and_rng", test_save_reports_position_and_rng},
+        {"step_by_step_replay_matches_restore", test_step_by_step_replay_matches_restore},
         {"restore_rejects_bad_state", test_restore_rejects_bad_state},
         {"stops_at_context_limit", test_stops_at_context_limit},
     };
