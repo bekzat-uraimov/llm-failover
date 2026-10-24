@@ -1,71 +1,115 @@
 # llm-failover
 
+[![ci](https://github.com/bekzat-uraimov/llm-failover/actions/workflows/ci.yml/badge.svg)](https://github.com/bekzat-uraimov/llm-failover/actions/workflows/ci.yml)
+
 Kill the worker mid-sentence. Another one finishes it, byte for byte.
 
-When an LLM worker dies halfway through a generation, its KV cache dies with it. This project takes the position that the KV cache doesn't need to survive. Given the model weights, the token history, the sampler's RNG state and the current position, the next token is fully determined. So a replacement worker can replay the tokens, rebuild the cache and continue the exact same output. This repo builds that recovery path one piece at a time, using Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) `stories15M` model as the workload.
+![Demo: the worker is killed at token 80, another worker finishes the story, and both runs have the same SHA-256](assets/demo.gif)
 
-## Status
+When an LLM worker dies halfway through a generation, its KV cache dies with it. This project takes the position that the KV cache doesn't need to survive. Given the model weights, the token history, the sampler's RNG state and the current position, the next token is fully determined. So a replacement worker can replay the tokens, rebuild the cache and continue the exact same output.
 
-Done:
+It's a small study of one systems problem, not a serving stack: C++ workers running Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) `stories15M` model, a Python router that keeps the token log, and a test that kills workers mid-story and compares SHA-256 against an uninterrupted run.
 
-- **Engine** ([engine/](engine/)). llama2.c's forward pass, tokenizer and sampler wrapped in a C++ `Engine` class with `save()` and `restore()`. `restore()` rebuilds the KV cache by replaying the token history, then sets the RNG state. Output is byte-identical to llama2.c's own `run` for the same seed and prompt (checked by hand on 5 seed/prompt pairs, including one that hits the UTF-8 byte fallback).
-- **Save/restore proof.** Generate 100 tokens straight, or generate 50, restore into a *different* engine and generate 50 more. Both give the same 100 tokens ([engine/test_engine.cpp](engine/test_engine.cpp)).
-- **Worker** ([worker/worker.cpp](worker/worker.cpp)). TCP server that streams tokens as JSON lines. It answers `PING` and `STOP` between tokens, so it stays responsive mid-generation.
-- **Cross-process resume.** Worker A streams 100 tokens. Worker B, a separate process, gets the first 50 via `RESUME` and produces the same last 50 tokens, positions and RNG states ([tests/test_worker.py](tests/test_worker.py)).
-- **Router** ([router/router.py](router/router.py)). Python asyncio. Clients talk only to the router, which hands each session to a free worker and keeps the session log: epoch, position, token and RNG state for every token. A token is *committed* when it's in the log, and the client only ever sees committed tokens. A token is accepted only if its session, epoch and position are exactly what the log expects next. Duplicates, gaps, old epochs and sessions the worker doesn't own are dropped ([tests/test_router.py](tests/test_router.py)).
-- **Failover.** The router `PING`s every worker every 200 ms. A worker whose connection drops, or that stays silent for 3 pings (about 600 ms), is declared dead. Its session goes to another worker with the next epoch, as a `RESUME` built from the log. `kill -9` and `SIGSTOP` on the generating worker mid-story both give a story byte-identical to the uninterrupted run (see the demo below). A session gives up after 3 recoveries.
-- **Client** ([client/client.py](client/client.py)). Sends a prompt to the router and prints the story as it streams.
+## How it works
 
-Next, in order:
+```
+             +---------+
+  client --> | router  |  session log: (session, epoch, pos, token, rng_state)
+  (prompt)   |         |  the client only sees a token once it's logged
+             +----+----+
+                  |  PING every 200 ms, START / RESUME, TOKEN stream
+          +-------+-------+
+          |               |
+     +----v----+     +----v----+
+     | worker A|     | worker B|   each runs the whole model, one session at a time
+     +---------+     +---------+
+```
 
-1. CI test: SHA-256 of the failover run matches the uninterrupted run, in GitHub Actions.
-2. Measurements: tokens per second, failover pause, replay cost vs context length.
-3. Two cloud servers, kill test over a real network.
+1. The router assigns a session to a free worker with epoch 1. The worker streams `TOKEN {pos, token, rng_state}`, where `rng_state` is the sampler state *after* that token.
+2. The router logs each token, then forwards its text to the client. Tokens with the wrong session, epoch or position are dropped.
+3. Worker A dies: its socket closes, or it misses 3 heartbeats (about 600 ms).
+4. The router sends worker B a `RESUME` with epoch 2: every logged token plus the last `rng_state`. B replays the tokens through the model to rebuild the KV cache, sets the RNG, and keeps going. The next token is the one A would have produced.
+
+## What's verified
+
+| Claim | Where |
+| --- | --- |
+| Same seed gives the same tokens; restoring into a fresh engine continues identically | [engine/test_engine.cpp](engine/test_engine.cpp) |
+| Output is byte-identical to llama2.c's own `run`, built from source on the same machine, on 5 seed/prompt pairs including a UTF-8 byte-fallback prompt | [tests/test_router.py](tests/test_router.py) |
+| A second worker process given the first 50 tokens produces the same last 50 tokens, positions and RNG states | [tests/test_worker.py](tests/test_worker.py) |
+| Duplicates, gaps, old epochs and sessions a worker doesn't own are dropped | [tests/test_router.py](tests/test_router.py) |
+| `kill -9` or `kill -STOP` on the generating worker at tokens 10, 80 and 150 gives the same SHA-256 as the normal run | [scripts/demo.py](scripts/demo.py) `--check` |
+
+CI runs all of it on Ubuntu (gcc, Python 3.10) and macOS on Apple Silicon (clang, Python 3.13).
+
+Not done: running the workers on two separate machines. Everything above is processes on one host.
 
 ## Run it
 
 Needs a C++17 compiler and Python 3.10+. No other dependencies.
 
 ```bash
-make model     # downloads stories15M.bin (60 MB) and tokenizer.bin into models/
-make test      # C++ engine tests + Python tests
+make model     # downloads stories15M.bin (60 MB) and tokenizer.bin, checks their SHA-256
+make test      # builds everything, plus llama2.c from source as the reference
+make demo      # the GIF above: normal run, then kill -9 at token 80, compare SHA-256
 ```
 
-Then, each in its own terminal:
+`python3 scripts/demo.py --signal stop` freezes the worker instead of killing it, so only the heartbeat can notice.
+
+To run the pieces by hand, each in its own terminal:
 
 ```bash
 make worker              # worker on 127.0.0.1:9001
 make worker PORT=9002    # second worker
-make router              # router on 127.0.0.1:9000, connected to both workers
+make router              # router on 127.0.0.1:9000, connected to both
 python3 -m client.client --prompt "Once upon a time" --seed 42 --steps 100
 ```
 
-```
-Once upon a time, there was a boy named Timmy. Timmy loved to play with his toys. One day, he found a shiny thing on the ground. It was a ring with a pointy end. Timmy put it on his finger and said, "I think this is mine now."
-Timmy's mom saw him and said, "Timmy, that ring is not yours. You should give it back." Timmy didn't want to give it
-```
+Kill either worker while the story streams; the client just sees a short pause. `python3 -m router.router --events events.jsonl ...` writes one JSON line per commit, assignment, loss and recovery.
 
-Same output as `./run stories15M.bin -s 42 -n 100 -i "Once upon a time"` in llama2.c.
+## Measurements
 
-## Failover demo
+Measured on Apple M3 Pro, macOS, Apple clang version 16.0.0 (clang-1600.0.26.6), Python 3.14.5. Median of 3 runs. Story: seed 42, "Once upon a time".
 
-Same setup, `--steps 256`, and `kill -9` on the worker generating the story partway through. Router log:
+| One session, through the router | |
+| --- | --- |
+| tokens per second | 155 |
+| time between tokens, median | 6.4 ms |
+| time between tokens, p99 | 7.1 ms |
 
-```
-22:25:33,998 session ee94f22a epoch 1 -> worker 127.0.0.1:9001 (START)
-22:25:34,506 worker 127.0.0.1:9001 lost
-22:25:34,506 session ee94f22a recovering at pos 79: worker 127.0.0.1:9001 lost
-22:25:34,506 session ee94f22a epoch 2 -> worker 127.0.0.1:9002 (RESUME)
-22:25:34,998 session ee94f22a resumed on 127.0.0.1:9002 at pos 79: replay 491 ms, 492 ms after the worker was lost
-22:25:35,847 session ee94f22a done: 210 tokens
-```
+Horizontal scaling here means serving more sessions at once, not making one story faster. Every token of a session comes from one worker:
 
-```
-54697c5fa152fd51cccf4d68e9f2618c6848e65292390b45e27270eff086c585  llama2.c, uninterrupted
-54697c5fa152fd51cccf4d68e9f2618c6848e65292390b45e27270eff086c585  through the router, worker killed at token 79
-```
+| Sessions at once | 1 worker | 2 workers |
+| --- | --- | --- |
+| 1 | 151 tok/s | 139 tok/s |
+| 2 | 148 tok/s | 281 tok/s |
+| 4 | 135 tok/s | 280 tok/s |
 
-A killed process closes its socket, so the router notices right away. A frozen one (`kill -STOP`) keeps the socket open; the heartbeat catches it instead, about 700 ms after its last answer. Both cases are in [tests/test_router.py](tests/test_router.py).
+One session runs on one worker either way; the 151 vs 139 difference is noise.
+
+Failover pause is the gap the client sees between the last token before the interruption and the first one after. After `kill -9` it's almost all replay. After `kill -STOP` add the heartbeat timeout, about 700 ms:
+
+| Worker interrupted at token | `kill -9`: pause seen by client | `kill -STOP`: pause seen by client |
+| --- | --- | --- |
+| 64 | 422 ms | 1172 ms |
+| 128 | 863 ms | 1490 ms |
+| 192 | 1323 ms | 2121 ms |
+
+Replay time grows with context length, slightly faster than linearly, because attention at position *n* looks at all *n* earlier positions:
+
+| Context length | Replay time | Per token | RESUME message |
+| --- | --- | --- | --- |
+| 64 tokens | 427 ms | 6.77 ms | 477 bytes |
+| 128 tokens | 876 ms | 6.89 ms | 844 bytes |
+| 256 tokens | 1882 ms | 7.38 ms | 1,594 bytes |
+
+| State for a full 256-token context | Size |
+| --- | --- |
+| KV cache (6 layers × 256 positions × 288 dims × K and V × 4 bytes) | 3.5 MB |
+| Router log (token id + RNG state per token) | 3.1 KB |
+| What a RESUME needs (tokens + the last RNG state) | 1.0 KB |
+
+Reproduce with `python3 scripts/measure.py`.
 
 ## Protocol
 
@@ -96,19 +140,17 @@ Router and worker. `steps` means the same as llama2.c's `-n`: the number of forw
 | worker → | `PONG` | |
 | worker → | `ERROR` | `error` |
 
-Every `TOKEN` carries the RNG state *after* that token was sampled. A log of `TOKEN`s is enough to resume on another worker: send the tokens so far plus the last `rng_state` in a `RESUME`.
-
 ## Design notes
 
-- **Replay instead of shipping the KV cache.** For stories15M the full KV cache is about 3.5 MB (6 layers × 256 positions × 288 dims × K and V × 4 bytes). 256 tokens of history is about 1 KB. Replaying costs compute on recovery but keeps the durable state tiny.
-- **Determinism has conditions.** Same weights, tokenizer, binary and CPU architecture on every worker. The matmul is single threaded so the float summation order never changes, and the build doesn't use `-ffast-math`, which would let the compiler reorder float math. This is not a claim of determinism across arbitrary hardware.
-- **64-bit RNG state over JSON.** The worker's JSON reader keeps numbers as text, so `rng_state` round-trips all 64 bits. A double would silently drop the low bits past 2^53.
-- **One session per worker, one thread.** Between tokens the worker polls its socket without blocking. That keeps `PING` latency under one token's time without threads or locks.
-- **Log first, then the client.** Every token takes one extra hop through the router before the client sees it. That costs latency, but it means the client can never have seen a token that isn't in the log, so recovery can't produce a story that contradicts what the client already printed.
+- **Replay instead of shipping the KV cache.** A full context's KV cache is 3.5 MB; the tokens plus the last RNG state are 1 KB. Replay costs compute on recovery, about 7 ms per token here, so 1.9 s for a full context. For a tiny model that's the right trade. For a large model with long contexts, copying the cache would start to win.
+- **Determinism has conditions.** Same weights, tokenizer, binary and CPU architecture on every worker. The matmul is single threaded so the float summation order never changes, and the build doesn't use `-ffast-math`, which would let the compiler reorder float math. This is not a claim of determinism across arbitrary hardware, which is why the tests compare against llama2.c built on the same machine rather than against a saved output.
+- **Log first, then the client.** Every token takes one extra hop through the router before the client sees it. That costs latency, but the client can never have seen a token that isn't in the log, so a recovery can't contradict what the client already printed.
 - **Epochs fence off old workers.** Each assignment of a session gets a new epoch, and anything sent under an old one is dropped. A worker that comes back after being declared dead can't write into a session that has moved on.
-- **Replay doesn't block the heartbeat.** Replaying 79 tokens takes about 500 ms, and a full 256-token context longer than the 600 ms a worker may stay silent. So the worker replays one position per loop and answers `PING`s in between, the same way it does while generating. Otherwise the heartbeat would kill the worker doing the recovery.
+- **Heartbeat timeout is a tradeoff.** 3 missed pings at 200 ms means a frozen worker costs well under a second of detection. Shorter would recover faster but would also kill workers that are only slow for a moment.
+- **Replay doesn't block the heartbeat.** A full 256-token replay takes longer than the 600 ms a worker may stay silent. So the worker replays one position per loop and answers `PING`s in between, the same way it does while generating. Otherwise the heartbeat would kill the worker doing the recovery.
 - **Connected doesn't mean alive.** The kernel completes a TCP handshake even for a frozen process. After reconnecting, a worker only gets sessions once it has answered a message.
-- **Heartbeat timeout is a tradeoff.** 600 ms means a frozen worker costs well under a second. Shorter would recover faster but would also kill workers that are just slow for a moment.
+- **64-bit RNG state over JSON.** The worker's JSON reader keeps numbers as text, so `rng_state` round-trips all 64 bits. A double would silently drop the low bits past 2^53.
+- **One session per worker, one thread.** No locks, and `PING` latency stays under one token's time. More sessions at once means more workers, not more threads.
 - **The router is a single point of failure.** Its log lives in memory. Worker failure is the focus here; replicating the router is out of scope.
 
 ## Credits
