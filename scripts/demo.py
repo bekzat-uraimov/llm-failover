@@ -29,13 +29,13 @@ RED, GREEN, DIM, RESET = "\033[31m", "\033[32m", "\033[2m", "\033[0m"
 
 
 class Cluster:
-    """Two worker processes and a router, all on free localhost ports."""
+    """Worker processes and a router, all on free localhost ports."""
 
-    def __init__(self):
+    def __init__(self, n_workers: int = 2):
         self.tmp = tempfile.TemporaryDirectory()
         self.events_path = os.path.join(self.tmp.name, "events.jsonl")
         self.workers: dict[int, subprocess.Popen] = {}
-        for _ in range(2):
+        for _ in range(n_workers):
             proc, port = self.start_worker(0)
             self.workers[port] = proc
         cmd = [sys.executable, "-m", "router.router", "--port", "0", "--events", self.events_path]
@@ -97,7 +97,7 @@ class Cluster:
 def run_story(cluster: Cluster, args, kill_at: int | None = None, sig: int = signal.SIGKILL,
               echo: bool = False) -> dict:
     req = {"type": "GENERATE", "prompt": args.prompt, "seed": args.seed, "steps": args.steps}
-    out = {"text": "", "victim": None, "pause_ms": None}
+    out = {"text": "", "victim": None, "pause_ms": None, "times": []}  # times: (monotonic, pos) per TEXT
     killed_at = None
     with socket.create_connection(("127.0.0.1", cluster.port), timeout=30) as sock:
         f = sock.makefile("rwb")
@@ -109,8 +109,10 @@ def run_story(cluster: Cluster, args, kill_at: int | None = None, sig: int = sig
                 raise RuntimeError(msg["error"])
             if msg["type"] == "END":
                 break
+            now = time.monotonic()
             if killed_at and out["pause_ms"] is None:
-                out["pause_ms"] = (time.monotonic() - killed_at) * 1000
+                out["pause_ms"] = (now - killed_at) * 1000
+            out["times"].append((now, msg["pos"]))
             out["text"] += msg["text"]
             if echo:
                 sys.stdout.write(msg["text"])
