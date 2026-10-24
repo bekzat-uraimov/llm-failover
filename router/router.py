@@ -179,7 +179,7 @@ class Router:
                 await self.write(writer, {"type": "ERROR", "error": f"bad request: {e}"})
                 return
             try:
-                worker = await asyncio.wait_for(self.acquire(), self.worker_timeout)
+                worker = await asyncio.wait_for(self.acquire(session), self.worker_timeout)
             except asyncio.TimeoutError:
                 session.state = "FAILED"
                 await self.write(writer, {"type": "ERROR", "error": "no worker available"})
@@ -242,10 +242,14 @@ class Router:
 
     # Scheduling
 
-    async def acquire(self) -> Worker:
+    async def acquire(self, session: Session) -> Worker:
         while True:
             for w in self.workers:
                 if w.free:
+                    # Reserve it right here. Before Python 3.12, wait_for() runs this in its own
+                    # task, so two clients could both see the same worker free before either
+                    # one got to assign().
+                    w.session = session
                     return w
             self._freed.clear()
             await self._freed.wait()
@@ -287,7 +291,7 @@ class Router:
 
     async def reassign(self, session: Session):
         try:
-            worker = await asyncio.wait_for(self.acquire(), self.worker_timeout)
+            worker = await asyncio.wait_for(self.acquire(session), self.worker_timeout)
         except asyncio.TimeoutError:
             if session.state == "RECOVERING":
                 self.fail(session, "no worker left to recover on")
@@ -295,6 +299,8 @@ class Router:
         # The client may have hung up while we waited
         if session.state == "RECOVERING":
             self.assign(session, worker)
+        else:
+            self.release(worker)
 
     def stop(self, session: Session):
         if session.state == "RECOVERING":

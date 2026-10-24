@@ -216,6 +216,19 @@ class RouterWithWorkersTest(RouterTestCase):
         workers = {self.router.sessions[m[-1]["session"]].worker.name for m in (a, b)}
         self.assertEqual(len(workers), 2)
 
+    async def test_acquire_in_separate_tasks_never_hands_out_one_worker_twice(self):
+        # What wait_for() does before Python 3.12: each acquire() runs in its own task
+        a = self.router.new_session({"type": "GENERATE", "seed": 1})
+        b = self.router.new_session({"type": "GENERATE", "seed": 2})
+        wa, wb = await asyncio.gather(asyncio.create_task(self.router.acquire(a)),
+                                      asyncio.create_task(self.router.acquire(b)))
+
+        self.assertIsNot(wa, wb)
+        self.assertIs(wa.session, a)
+        self.assertIs(wb.session, b)
+        self.router.release(wa)
+        self.router.release(wb)
+
     async def test_more_clients_than_workers_wait_their_turn(self):
         runs = await asyncio.gather(*[
             generate(self.port, STORY) for _ in range(4)
