@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: macos-14
+            python: "3.13"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: stories15M-${{ hashFiles('Makefile') }}
+
+      - name: Build, then test against llama2.c built on this machine
+        run: make test
+
+      - name: Kill workers mid-story; every SHA-256 must match the normal run
+        run: python3 scripts/demo.py --check
