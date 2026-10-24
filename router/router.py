@@ -19,6 +19,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import TextIO
 
 from router.tokenizer import decode, load_vocab
 
@@ -72,6 +73,7 @@ class Worker:
         # accepts TCP connections (the kernel does the handshake), so connecting proves nothing.
         self.ready = False
         self.last_seen = 0.0
+        self.lost_reason = ""
 
     @property
     def name(self) -> str:
@@ -99,25 +101,29 @@ class Worker:
                     if not self.ready:
                         self.ready = True
                         log.info("worker %s ready", self.name)
+                        self.router.event("worker_ready", worker=self.name)
                         self.router.worker_freed()
                     self.router.on_worker_message(self, json.loads(line))
             except (OSError, ValueError, KeyError, TypeError) as e:
                 # A malformed message means something is badly wrong with that worker; reconnect
                 log.warning("worker %s: %r", self.name, e)
+                self.lost_reason = f"bad message: {e!r}"
             finally:
                 beat.cancel()
                 self.writer.close()
                 self.writer = None
                 was_ready, self.ready = self.ready, False
-                self.router.on_worker_lost(self, was_ready)
+                reason, self.lost_reason = self.lost_reason or "connection closed", ""
+                self.router.on_worker_lost(self, was_ready, reason)
 
     async def heartbeat(self):
         interval = self.router.ping_interval
         while True:
             silent = time.monotonic() - self.last_seen
             if silent > interval * self.router.missed_pings:
+                self.lost_reason = f"silent for {silent * 1000:.0f} ms"
                 if self.ready:
-                    log.warning("worker %s silent for %.0f ms, declaring it dead", self.name, silent * 1000)
+                    log.warning("worker %s %s, declaring it dead", self.name, self.lost_reason)
                 # abort(), not close(): close() waits to flush, and a hung worker never reads
                 self.writer.transport.abort()
                 return
@@ -127,8 +133,10 @@ class Worker:
 
 class Router:
     def __init__(self, workers: list[tuple[str, int]], vocab: list[bytes], worker_timeout: float = 10.0,
-                 ping_interval: float = PING_INTERVAL, missed_pings: int = MISSED_PINGS):
+                 ping_interval: float = PING_INTERVAL, missed_pings: int = MISSED_PINGS,
+                 events: TextIO | None = None):
         self.vocab = vocab
+        self.events = events
         self.workers = [Worker(self, host, port) for host, port in workers]
         self.worker_timeout = worker_timeout
         self.ping_interval = ping_interval
@@ -142,6 +150,12 @@ class Router:
         for w in self.workers:
             self.spawn(w.run())
         return await asyncio.start_server(self.handle_client, host, port)
+
+    def event(self, name: str, **fields):
+        """Append one JSON line to the event log: every commit, assignment, loss and recovery."""
+        if self.events:
+            self.events.write(json.dumps({"t": time.time(), "event": name, **fields}) + "\n")
+            self.events.flush()
 
     def spawn(self, coro):
         # asyncio only keeps weak references to tasks, so hold on to them until they finish
@@ -193,6 +207,7 @@ class Router:
 
         session = Session(id=secrets.token_hex(4), prompt=prompt, seed=seed, steps=steps)
         self.sessions[session.id] = session
+        self.event("session", session=session.id, prompt=prompt, seed=seed, steps=steps)
         return session
 
     async def stream(self, session: Session, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -254,6 +269,8 @@ class Router:
             msg["steps"] = session.steps
         worker.send(msg)
         log.info("session %s epoch %d -> worker %s (%s)", session.id, session.epoch, worker.name, msg["type"])
+        self.event("assign", session=session.id, epoch=session.epoch, worker=worker.name,
+                   kind=msg["type"], pos=len(session.tokens))
 
     def recover(self, session: Session, reason: str):
         session.worker = None
@@ -264,6 +281,8 @@ class Router:
         session.state = "RECOVERING"
         session.lost_at = time.monotonic()
         log.warning("session %s recovering at pos %d: %s", session.id, len(session.tokens), reason)
+        self.event("recovering", session=session.id, pos=len(session.tokens), reason=reason,
+                   attempt=session.recoveries)
         self.spawn(self.reassign(session))
 
     async def reassign(self, session: Session):
@@ -280,10 +299,12 @@ class Router:
     def stop(self, session: Session):
         if session.state == "RECOVERING":
             session.state = "STOPPED"
+            self.event("stopped", session=session.id)
             return
         if session.state != "RUNNING":
             return
         session.state = "STOPPED"
+        self.event("stopped", session=session.id)
         # The worker stays busy until it confirms with STOPPED
         session.worker.send({"type": "STOP", "session": session.id})
         log.info("session %s stopped: client hung up", session.id)
@@ -296,6 +317,7 @@ class Router:
         session.state = "FAILED"
         session.out.put_nowait({"type": "ERROR", "error": reason})
         log.warning("session %s failed: %s", session.id, reason)
+        self.event("failed", session=session.id, reason=reason)
 
     # Worker side
 
@@ -332,13 +354,16 @@ class Router:
 
         if kind == "STARTED":
             session.tokens = list(msg["tokens"])
+            self.event("started", session=session.id, epoch=session.epoch, prompt_tokens=len(session.tokens))
             # Prompt tokens come from the client's own text, so they're committed as-is
             for pos in range(1, len(session.tokens)):
                 self.emit_text(session, pos)
         elif kind == "RESUMED":
+            since_lost = (time.monotonic() - session.lost_at) * 1000
             log.info("session %s resumed on %s at pos %d: replay %.0f ms, %.0f ms after the worker was lost",
-                     session.id, worker.name, msg["pos"], msg["replay_ms"],
-                     (time.monotonic() - session.lost_at) * 1000)
+                     session.id, worker.name, msg["pos"], msg["replay_ms"], since_lost)
+            self.event("resumed", session=session.id, epoch=session.epoch, worker=worker.name, pos=msg["pos"],
+                       replay_ms=msg["replay_ms"], since_lost_ms=round(since_lost, 2))
         elif kind == "TOKEN":
             self.commit(session, msg)
         elif kind == "DONE":
@@ -346,6 +371,7 @@ class Router:
             session.out.put_nowait({"type": "END", "session": session.id, "reason": msg.get("reason")})
             self.release(worker)
             log.info("session %s done: %d tokens", session.id, len(session.tokens))
+            self.event("done", session=session.id, reason=msg.get("reason"), tokens=len(session.tokens))
 
     def commit(self, session: Session, msg: dict):
         pos = msg["pos"]
@@ -354,6 +380,8 @@ class Router:
             return
         session.log.append(Record(msg["epoch"], pos, msg["token"], msg["rng_state"]))
         session.tokens.append(msg["token"])
+        self.event("commit", session=session.id, epoch=msg["epoch"], pos=pos, token=msg["token"],
+                   rng_state=msg["rng_state"])
         # Committed. Only now does the client get to see it.
         self.emit_text(session, pos)
 
@@ -365,14 +393,16 @@ class Router:
     def drop(self, msg: dict, reason: str):
         self.dropped += 1
         log.warning("dropped %s (%s)", msg, reason)
+        self.event("drop", reason=reason, msg=msg)
 
-    def on_worker_lost(self, worker: Worker, was_ready: bool):
+    def on_worker_lost(self, worker: Worker, was_ready: bool, reason: str):
         if was_ready:
-            log.warning("worker %s lost", worker.name)
+            log.warning("worker %s lost: %s", worker.name, reason)
+            self.event("worker_lost", worker=worker.name, reason=reason)
         session = worker.session
         worker.session = None
         if session and session.state == "RUNNING":
-            self.recover(session, f"worker {worker.name} lost")
+            self.recover(session, f"worker {worker.name} lost ({reason})")
 
 
 def parse_addr(addr: str) -> tuple[str, int]:
@@ -381,7 +411,8 @@ def parse_addr(addr: str) -> tuple[str, int]:
 
 
 async def serve(args):
-    router = Router([parse_addr(w) for w in args.worker], load_vocab(args.tokenizer))
+    events = open(args.events, "w") if args.events else None
+    router = Router([parse_addr(w) for w in args.worker], load_vocab(args.tokenizer), events=events)
     server = await router.start(args.host, args.port)
     host, port = server.sockets[0].getsockname()[:2]
     print(f"router listening on {host}:{port}", flush=True)
@@ -395,6 +426,7 @@ def main():
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("--worker", action="append", required=True, help="host:port, repeat for more workers")
     p.add_argument("--tokenizer", default="models/tokenizer.bin")
+    p.add_argument("--events", help="write a JSON line per router event (commits, failures, recoveries) here")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")

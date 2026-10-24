@@ -1,28 +1,45 @@
 import asyncio
+import functools
+import io
 import json
 import logging
 import os
 import signal
+import subprocess
 import time
 import unittest
 
 import router.router
 from router.router import MAX_RECOVERIES, Router
-from router.tokenizer import load_vocab
-from tests.test_worker import MODEL, TOKENIZER, WORKER, start_worker
+from router.tokenizer import decode, load_vocab
+from tests.test_worker import MODEL, ROOT, TOKENIZER, WORKER, Conn, start_worker
 
 # Drops and disconnects are expected here; their warnings would bury the test output
 logging.getLogger("router").setLevel(logging.CRITICAL)
 
 HAVE_WORKER = os.path.exists(WORKER) and os.path.exists(MODEL)
+# `make reference` builds llama2.c's own binary here
+LLAMA2C = os.environ.get("LLAMA2C_RUN", os.path.join(ROOT, "build", "llama2.c", "run"))
 
-# llama2.c: ./run stories15M.bin -s 42 -n 100 -i "Once upon a time", minus the trailing newline
-STORY_42 = (
-    'Once upon a time, there was a boy named Timmy. Timmy loved to play with his toys. One day, he found '
-    'a shiny thing on the ground. It was a ring with a pointy end. Timmy put it on his finger and said, '
-    '"I think this is mine now."\nTimmy\'s mom saw him and said, "Timmy, that ring is not yours. You should '
-    'give it back." Timmy didn\'t want to give it'
-)
+STORY = {"prompt": "Once upon a time", "seed": 42, "steps": 100}
+
+
+@functools.cache
+def story() -> str:
+    """STORY generated straight through one worker, no router, nothing killed: the reference run."""
+    proc, port = start_worker()
+    conn = Conn(port)
+    try:
+        conn.send({"type": "START", "session": "ref", "epoch": 1, **STORY})
+        msgs = conn.recv_until("DONE")
+    finally:
+        conn.close()
+        proc.kill()
+        proc.wait()
+        proc.stdout.close()
+    tokens = msgs[0]["tokens"] + [m["token"] for m in msgs if m["type"] == "TOKEN"]
+    vocab = load_vocab(TOKENIZER)
+    return b"".join(decode(vocab, a, b) for a, b in zip(tokens, tokens[1:])).decode()
 
 
 async def connect(port: int, req: dict | str):
@@ -74,6 +91,8 @@ class RouterTestCase(unittest.IsolatedAsyncioTestCase):
 @unittest.skipUnless(HAVE_WORKER, "run `make` and `make model` first")
 class RouterWithWorkersTest(RouterTestCase):
     async def asyncSetUp(self):
+        # In a thread: blocking the event loop would look to the heartbeat like silent workers
+        await asyncio.to_thread(story)
         self.procs = {}  # port -> worker process
         for _ in range(2):
             proc, port = start_worker()
@@ -90,8 +109,8 @@ class RouterWithWorkersTest(RouterTestCase):
             proc.stdout.close()
 
     async def run_and_interrupt(self, sig: int, at_pos: int) -> tuple[list[dict], int]:
-        """Stream STORY_42, and send `sig` to whichever worker is generating it at `at_pos`."""
-        reader, writer = await connect(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
+        """Stream STORY, and send `sig` to whichever worker is generating it at `at_pos`."""
+        reader, writer = await connect(self.port, STORY)
         msgs, victim = [], None
         try:
             while line := await asyncio.wait_for(reader.readline(), 10):
@@ -110,7 +129,7 @@ class RouterWithWorkersTest(RouterTestCase):
     async def test_kill_9_mid_story_gives_the_same_story(self):
         msgs, victim = await self.run_and_interrupt(signal.SIGKILL, at_pos=40)
 
-        self.assertEqual(text_of(msgs), STORY_42)
+        self.assertEqual(text_of(msgs), story())
         (session,) = self.router.sessions.values()
         self.assertEqual(session.state, "DONE")
         self.assertEqual(session.epoch, 2)
@@ -124,7 +143,7 @@ class RouterWithWorkersTest(RouterTestCase):
     async def test_frozen_worker_is_declared_dead_then_comes_back(self):
         msgs, victim = await self.run_and_interrupt(signal.SIGSTOP, at_pos=40)
 
-        self.assertEqual(text_of(msgs), STORY_42)
+        self.assertEqual(text_of(msgs), story())
         (session,) = self.router.sessions.values()
         self.assertEqual(session.epoch, 2)
 
@@ -132,18 +151,37 @@ class RouterWithWorkersTest(RouterTestCase):
         self.procs[victim].send_signal(signal.SIGCONT)
         await wait_until(lambda: all(w.free for w in self.router.workers))
         self.procs[session.worker.port].kill()
-        again = await generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
-        self.assertEqual(text_of(again), STORY_42)
+        again = await generate(self.port, STORY)
+        self.assertEqual(text_of(again), story())
 
-    async def test_story_through_router_matches_llama2c(self):
-        msgs = await generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
+    async def test_story_through_router_matches_a_straight_run(self):
+        msgs = await generate(self.port, STORY)
 
-        self.assertEqual(text_of(msgs), STORY_42)
+        self.assertEqual(text_of(msgs), story())
         self.assertEqual(msgs[-1]["type"], "END")
         self.assertEqual(msgs[-1]["reason"], "steps")
 
+    @unittest.skipUnless(os.path.exists(LLAMA2C), "run `make reference` to build llama2.c")
+    async def test_story_through_router_matches_llama2c_byte_for_byte(self):
+        cases = [
+            ("Once upon a time", 42, 100),
+            ("Once upon a time", 43, 100),
+            ("", 7, 256),
+            ("The little dog", 1234, 200),
+            ("Lily wanted a café ☕", 99, 150),  # ☕ isn't in the vocab: byte fallback
+        ]
+        for prompt, seed, steps in cases:
+            msgs = await generate(self.port, {"prompt": prompt, "seed": seed, "steps": steps})
+            # Async, so the router's heartbeat keeps running while llama2.c works
+            proc = await asyncio.create_subprocess_exec(
+                LLAMA2C, MODEL, "-z", TOKENIZER, "-s", str(seed), "-n", str(steps), "-i", prompt,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            ref, _ = await proc.communicate()
+            # llama2.c ends its output with a newline
+            self.assertEqual(text_of(msgs).encode() + b"\n", ref, (prompt, seed))
+
     async def test_log_holds_every_generated_token_once_in_order(self):
-        msgs = await generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
+        msgs = await generate(self.port, STORY)
 
         session = self.router.sessions[msgs[-1]["session"]]
         n_prompt = len(session.tokens) - len(session.log)
@@ -169,20 +207,20 @@ class RouterWithWorkersTest(RouterTestCase):
 
     async def test_two_clients_run_at_once_on_different_workers(self):
         a, b = await asyncio.gather(
-            generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100}),
-            generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100}),
+            generate(self.port, STORY),
+            generate(self.port, STORY),
         )
 
-        self.assertEqual(text_of(a), STORY_42)
-        self.assertEqual(text_of(b), STORY_42)
+        self.assertEqual(text_of(a), story())
+        self.assertEqual(text_of(b), story())
         workers = {self.router.sessions[m[-1]["session"]].worker.name for m in (a, b)}
         self.assertEqual(len(workers), 2)
 
     async def test_more_clients_than_workers_wait_their_turn(self):
         runs = await asyncio.gather(*[
-            generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100}) for _ in range(4)
+            generate(self.port, STORY) for _ in range(4)
         ])
-        self.assertEqual([text_of(r) for r in runs], [STORY_42] * 4)
+        self.assertEqual([text_of(r) for r in runs], [story()] * 4)
 
     async def test_client_hangup_stops_the_worker(self):
         reader, writer = await connect(self.port, {"prompt": "Once upon a time", "seed": 42})
@@ -192,8 +230,8 @@ class RouterWithWorkersTest(RouterTestCase):
 
         (session,) = self.router.sessions.values()
         await wait_until(lambda: session.state == "STOPPED" and all(w.free for w in self.router.workers))
-        msgs = await generate(self.port, {"prompt": "Once upon a time", "seed": 42, "steps": 100})
-        self.assertEqual(text_of(msgs), STORY_42)
+        msgs = await generate(self.port, STORY)
+        self.assertEqual(text_of(msgs), story())
 
     async def test_bad_requests_get_an_error(self):
         for req in ["nope", "[1, 2]", json.dumps({"type": "HELLO"}),
@@ -319,6 +357,27 @@ class RouterFencingTest(RouterTestCase):
         msgs = await client
         self.assertEqual(text_of(msgs), "Once upon a")
         self.assertEqual([r.epoch for r in self.router.sessions[sid].log], [1, 2])
+
+    async def test_event_log_records_the_failover(self):
+        self.router.events = io.StringIO()
+        client, sid, epoch = await self.begin()
+        self.fake.send(type="TOKEN", session=sid, epoch=epoch, pos=2, token=self.upon, rng_state=11)
+        await wait_until(lambda: len(self.router.sessions[sid].log) == 1)
+        self.fake.writer.close()
+        await self.fake.recv()
+        self.fake.send(type="RESUMED", session=sid, epoch=epoch + 1, pos=3, replay_ms=1.5)
+        self.fake.send(type="DONE", session=sid, epoch=epoch + 1, reason="steps")
+        await client
+
+        events = [json.loads(line) for line in self.router.events.getvalue().splitlines()]
+        names = [e["event"] for e in events if e["event"] != "worker_ready"]
+        self.assertEqual(names, ["session", "assign", "started", "commit", "worker_lost",
+                                 "recovering", "assign", "resumed", "done"])
+        by_name = {e["event"]: e for e in events}
+        self.assertEqual(by_name["commit"]["rng_state"], 11)
+        self.assertEqual(by_name["recovering"]["pos"], 3)
+        self.assertEqual(by_name["resumed"]["replay_ms"], 1.5)
+        self.assertTrue(all(isinstance(e["t"], float) for e in events))
 
     async def test_silent_worker_is_declared_dead_and_its_old_epoch_is_fenced_off(self):
         client, sid, epoch = await self.begin()
